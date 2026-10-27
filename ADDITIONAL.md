@@ -3,6 +3,7 @@
 Additional BitChord project and development information will be maintained here.
 
 ## Project
+- [Desktop (macOS / Windows / Linux)](DESKTOP.md): Build, run, and package the Compose Multiplatform desktop client.
 - [Listen Together Server Documentation](backend/README.md): Architecture, synchronization protocol, and deployment instructions for the party server.
 - [Lyrics Translation](docs/LYRICS_TRANSLATION.md): Pipeline documentation for on-demand lyrics translation, timing projection, and UI transitions.
 
