@@ -8,7 +8,9 @@ import com.sun.jna.Pointer
 import java.awt.Color
 import java.awt.Toolkit
 import java.awt.Window
+import java.lang.reflect.Proxy
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.swing.RootPaneContainer
 
 /**
  * macOS native window frame and vibrancy bridge via AppKit and Objective-C runtime (JNA).
@@ -19,9 +21,28 @@ internal object DesktopMacFrame {
 
     private val installed = AtomicBoolean(false)
     private var windowPtr: Pointer? = null
+    private var awtWindow: Window? = null
     private var effectViewPtr: Pointer? = null
     @Volatile
     private var currentBackdropKind: Int = 0
+    private var fullscreenObserversRegistered = false
+    private var eawtListenerRegistered = false
+    private var eawtListenerRef: Any? = null
+    private val fieldEditorStubInstalled = AtomicBoolean(false)
+    /** Target of an in-flight Space transition; null when AppKit has settled. */
+    @Volatile
+    private var fullscreenTransitionTarget: Boolean? = null
+    /** Electron-style queue: one pending desire while a transition is already running. */
+    @Volatile
+    private var pendingFullscreenDesire: Boolean? = null
+    /** Dedupes eAWT + NSNotification both reporting the same enter/exit. */
+    @Volatile
+    private var lastFullscreenUiState: Boolean? = null
+    private var pendingExitRepair: javax.swing.Timer? = null
+    private var darkAppearanceApplied = false
+    /** Style mask before we forced Resizable for a Space enter; restored on exit. */
+    @Volatile
+    private var styleMaskBeforeFullscreen: Long? = null
 
     private interface LibObjC : Library {
         fun objc_getClass(name: String): Pointer?
@@ -34,6 +55,21 @@ internal object DesktopMacFrame {
     private interface ActionCallback : Callback {
         fun invoke(self: Pointer, _cmd: Pointer, arg: Pointer)
     }
+
+    /** Returns nil so AppKit uses the default field editor. */
+    private interface FieldEditorCallback : Callback {
+        fun invoke(self: Pointer, _cmd: Pointer, sender: Pointer?, client: Pointer?): Pointer?
+    }
+
+    /** NSWindowStyleMaskResizable — AppKit refuses to expand into a Space without this bit
+     * (OpenJFX JDK-8087498 / JDK-8353314, Compose #4573 for undecorated windows). */
+    private const val NS_WINDOW_STYLE_MASK_RESIZABLE = 1L shl 3
+
+    /** NSWindowStyleMaskFullScreen — set while the window occupies its own Space. */
+    private const val NS_WINDOW_STYLE_MASK_FULL_SCREEN = 1L shl 14
+
+    /** NSWindowCollectionBehaviorFullScreenPrimary — allows -[NSWindow toggleFullScreen:]. */
+    private const val NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_PRIMARY = 1L shl 7
 
     private val objc: LibObjC? by lazy {
         if (!DesktopPlatform.isMac) null
@@ -66,6 +102,65 @@ internal object DesktopMacFrame {
         }
     }
 
+    private val toggleFullScreenCallbackRef = object : ActionCallback {
+        override fun invoke(self: Pointer, _cmd: Pointer, arg: Pointer) {
+            runCatching {
+                toggleFullScreenOnMainThread()
+            }.onFailure {
+                fullscreenTransitionTarget = null
+                DesktopTrackLog.log("DesktopMacFrame toggleFullScreen main thread error: ${it.message}")
+            }
+        }
+    }
+
+    private val ensureResizableCallbackRef = object : ActionCallback {
+        override fun invoke(self: Pointer, _cmd: Pointer, arg: Pointer) {
+            runCatching {
+                windowPtr?.let { ensureResizableStyleMaskOnMainThread(it) }
+            }.onFailure {
+                DesktopTrackLog.log("DesktopMacFrame ensureResizable main thread error: ${it.message}")
+            }
+        }
+    }
+
+    private val restoreStyleMaskCallbackRef = object : ActionCallback {
+        override fun invoke(self: Pointer, _cmd: Pointer, arg: Pointer) {
+            runCatching {
+                windowPtr?.let { restoreStyleMaskAfterFullscreenOnMainThread(it) }
+            }.onFailure {
+                DesktopTrackLog.log("DesktopMacFrame restoreStyleMask main thread error: ${it.message}")
+            }
+        }
+    }
+
+    private val didEnterFullScreenRef = object : ActionCallback {
+        override fun invoke(self: Pointer, _cmd: Pointer, arg: Pointer) {
+            onNativeFullscreenChanged(entered = true)
+            DesktopTrackLog.log("DesktopMacFrame: entered full-screen Space")
+        }
+    }
+
+    private val didExitFullScreenRef = object : ActionCallback {
+        override fun invoke(self: Pointer, _cmd: Pointer, arg: Pointer) {
+            onNativeFullscreenChanged(entered = false)
+            DesktopTrackLog.log("DesktopMacFrame: left full-screen Space")
+        }
+    }
+
+    /**
+     * Newer AppKit calls this on the window delegate during setStyleMask: (fullscreen enter)
+     * without a respondsToSelector: guard. AWTWindow does not implement it, which aborts the
+     * process. Returning nil keeps the default field editor.
+     */
+    private val fieldEditorStubRef = object : FieldEditorCallback {
+        override fun invoke(
+            self: Pointer,
+            _cmd: Pointer,
+            sender: Pointer?,
+            client: Pointer?,
+        ): Pointer? = null
+    }
+
     private val helperInstance: Pointer? by lazy {
         initHelper()
     }
@@ -82,6 +177,18 @@ internal object DesktopMacFrame {
         objc?.sel_registerName("activateApp:")
     }
 
+    private val selToggleFullScreenAction: Pointer? by lazy {
+        objc?.sel_registerName("toggleFullScreenAction:")
+    }
+
+    private val selEnsureResizableAction: Pointer? by lazy {
+        objc?.sel_registerName("ensureResizableAction:")
+    }
+
+    private val selRestoreStyleMaskAction: Pointer? by lazy {
+        objc?.sel_registerName("restoreStyleMaskAction:")
+    }
+
     private val threadUtilities: Pointer? by lazy {
         Toolkit.getDefaultToolkit() // Ensure AWT native libs are loaded
         objc?.objc_getClass("ThreadUtilities")
@@ -93,14 +200,20 @@ internal object DesktopMacFrame {
         val nsObjectClass = o.objc_getClass("NSObject") ?: return null
         val clsName = "BitChordMacFrameHelper"
         var cls = o.objc_getClass(clsName)
+        val created = cls == null
         if (cls == null) {
             cls = o.objc_allocateClassPair(nsObjectClass, clsName, 0L) ?: return null
-            val sel = o.sel_registerName("applyBackdrop:")
-            o.class_addMethod(cls, sel, callbackRef, "v@:@")
-            val selActivate = o.sel_registerName("activateApp:")
-            o.class_addMethod(cls, selActivate, activateCallbackRef, "v@:@")
-            o.objc_registerClassPair(cls)
         }
+        // Add every selector we need. class_addMethod is a no-op when the method already exists,
+        // so a helper left over from an earlier run in the same JVM still picks up new ones.
+        o.class_addMethod(cls, o.sel_registerName("applyBackdrop:"), callbackRef, "v@:@")
+        o.class_addMethod(cls, o.sel_registerName("activateApp:"), activateCallbackRef, "v@:@")
+        o.class_addMethod(cls, o.sel_registerName("toggleFullScreenAction:"), toggleFullScreenCallbackRef, "v@:@")
+        o.class_addMethod(cls, o.sel_registerName("ensureResizableAction:"), ensureResizableCallbackRef, "v@:@")
+        o.class_addMethod(cls, o.sel_registerName("restoreStyleMaskAction:"), restoreStyleMaskCallbackRef, "v@:@")
+        o.class_addMethod(cls, o.sel_registerName("didEnterFullScreen:"), didEnterFullScreenRef, "v@:@")
+        o.class_addMethod(cls, o.sel_registerName("didExitFullScreen:"), didExitFullScreenRef, "v@:@")
+        if (created) o.objc_registerClassPair(cls)
         val selAlloc = o.sel_registerName("alloc")
         val selInit = o.sel_registerName("init")
         val alloc = send.invokePointer(arrayOf(cls, selAlloc)) ?: return null
@@ -272,16 +385,92 @@ internal object DesktopMacFrame {
             return false
         }
         windowPtr = nsWindow
+        awtWindow = window
         installed.set(true)
 
+        ensureAwtWindowFieldEditorStub()
+        enableEawtFullScreen(window)
         if (isMainThread()) {
-            runCatching { applyNativeBackdropOnMainThread(currentBackdropKind) }
+            runCatching {
+                ensureResizableStyleMask(nsWindow)
+                enableFullScreenPrimary(nsWindow)
+                registerFullscreenObservers(nsWindow)
+                applyNativeBackdropOnMainThread(currentBackdropKind)
+            }
         } else {
             dispatchToMainThread()
         }
         DesktopTrackLog.log("DesktopMacFrame: installed successfully on NSWindow $nsWindow")
         return true
     }
+
+    /**
+     * Prep for Compose [WindowPlacement.Fullscreen] / Skiko's native Space toggle:
+     * field-editor stub, eAWT flags, FullScreenPrimary, and Resizable style bit.
+     * Call before flipping placement — do not toggle AppKit yourself or Compose will fight it.
+     */
+    fun prepareNativeFullscreen(): Boolean {
+        if (!DesktopPlatform.isMac || !installed.get()) return false
+        val window = awtWindow ?: return false
+        ensureAwtWindowFieldEditorStub()
+        enableEawtFullScreen(window)
+        windowPtr?.let { ns ->
+            ensureResizableStyleMask(ns)
+            enableFullScreenPrimary(ns)
+            registerFullscreenObservers(ns)
+        }
+        return true
+    }
+
+    /**
+     * Direct AppKit toggle (green-button / system paths that bypass Compose placement).
+     * Prefer [prepareNativeFullscreen] + [WindowPlacement.Fullscreen] for in-app toggles.
+     */
+    fun setFullscreen(on: Boolean): Boolean {
+        if (!DesktopPlatform.isMac || !installed.get()) return false
+        val window = awtWindow ?: return false
+        if (isFullscreen() == on && fullscreenTransitionTarget == null) {
+            pendingFullscreenDesire = null
+            return true
+        }
+        if (fullscreenTransitionTarget != null) {
+            pendingFullscreenDesire = on
+            DesktopTrackLog.log("DesktopMacFrame: queued fullscreen desire=$on")
+            return true
+        }
+        prepareNativeFullscreen()
+        fullscreenTransitionTarget = on
+        return requestToggleFullScreen(window).also { ok ->
+            if (ok) DesktopTrackLog.log("DesktopMacFrame: requestToggleFullScreen toward $on")
+            else {
+                fullscreenTransitionTarget = null
+                DesktopTrackLog.log("DesktopMacFrame: requestToggleFullScreen failed")
+            }
+        }
+    }
+
+    /** Whether the NSWindow currently occupies a full-screen Space. */
+    fun isFullscreen(): Boolean {
+        if (!DesktopPlatform.isMac) return false
+        val o = objc ?: return false
+        val send = msgSend ?: return false
+        val nsWindow = windowPtr ?: return false
+        return runCatching {
+            val selStyleMask = o.sel_registerName("styleMask")
+            val mask = (send.invoke(Long::class.java, arrayOf(nsWindow, selStyleMask)) as? Number)?.toLong() ?: 0L
+            mask and NS_WINDOW_STYLE_MASK_FULL_SCREEN != 0L
+        }.getOrDefault(false)
+    }
+
+    /**
+     * What the next toggle should invert — pending desire, in-flight target, or settled state.
+     * Matches Electron not flipping `isFullScreen()` until the Space animation finishes.
+     */
+    fun desiredFullscreen(): Boolean =
+        pendingFullscreenDesire
+            ?: fullscreenTransitionTarget
+            ?: lastFullscreenUiState
+            ?: isFullscreen()
 
     /** Applies or removes the NSVisualEffectView native backdrop blur. */
     fun setBackdrop(nativeKind: Int): Boolean {
@@ -386,6 +575,161 @@ internal object DesktopMacFrame {
 
     private var windowConfigured = false
 
+    /**
+     * Space transitions are reported twice (eAWT + NSNotification). First report wins for UI.
+     * Do not touch Compose size or AWT bounds here — AppKit owns the frame (Electron model).
+     */
+    private fun onNativeFullscreenChanged(entered: Boolean) {
+        fullscreenTransitionTarget = null
+        if (lastFullscreenUiState != entered) {
+            lastFullscreenUiState = entered
+            DesktopWindowMode.adoptNativeFullscreen(entered)
+            updateCornerRadius(entered || DesktopWindowMode.maximized.value)
+            DesktopTrackLog.log(
+                "DesktopMacFrame: Space ${if (entered) "entered" else "exited"} " +
+                    "awt=${awtWindow?.width}x${awtWindow?.height}",
+            )
+        }
+        // Drain Electron-style pending desire after the animation settles.
+        val queued = pendingFullscreenDesire
+        pendingFullscreenDesire = null
+        if (queued != null && queued != entered) {
+            javax.swing.SwingUtilities.invokeLater { setFullscreen(queued) }
+            return
+        }
+        pendingExitRepair?.stop()
+        pendingExitRepair = null
+        if (entered) return
+        windowPtr?.let { restoreStyleMaskAfterFullscreen(it) }
+        val timer = javax.swing.Timer(350) {
+            pendingExitRepair = null
+            repairBackdropAfterFullscreen()
+        }
+        timer.isRepeats = false
+        pendingExitRepair = timer
+        timer.start()
+    }
+
+    /**
+     * Undecorated / transparent AWT windows often lack Resizable in their AppKit style mask.
+     * Without it, [toggleFullScreen:] creates a Space but leaves the content at the old size
+     * (Compose #4573 / OpenJFX JDK-8353314). [NSWindow setStyleMask:] must run on the AppKit
+     * main thread — calling it from AWT-EventQueue traps with "Must only be used from the main thread".
+     */
+    private fun ensureResizableStyleMask(nsWindow: Pointer) {
+        if (isMainThread()) {
+            ensureResizableStyleMaskOnMainThread(nsWindow)
+            return
+        }
+        val tu = threadUtilities ?: return
+        val helper = helperInstance ?: return
+        val selPerform = selPerformOnMain ?: return
+        val selAction = selEnsureResizableAction ?: return
+        val send = msgSend ?: return
+        // waitUntilDone=true so Resizable is set before Skiko/Compose toggles fullscreen.
+        runCatching {
+            send.invoke(arrayOf(tu, selPerform, selAction, helper, helper, true))
+        }.onFailure {
+            DesktopTrackLog.log("DesktopMacFrame: dispatch ensureResizable failed: ${it.message}")
+        }
+    }
+
+    private fun ensureResizableStyleMaskOnMainThread(nsWindow: Pointer) {
+        val o = objc ?: return
+        val send = msgSend ?: return
+        runCatching {
+            val selStyleMask = o.sel_registerName("styleMask")
+            val current = (send.invoke(Long::class.java, arrayOf(nsWindow, selStyleMask)) as? Number)
+                ?.toLong() ?: return
+            if (current and NS_WINDOW_STYLE_MASK_RESIZABLE != 0L) return
+            if (styleMaskBeforeFullscreen == null) styleMaskBeforeFullscreen = current
+            val selSetStyleMask = o.sel_registerName("setStyleMask:")
+            send.invoke(arrayOf(nsWindow, selSetStyleMask, current or NS_WINDOW_STYLE_MASK_RESIZABLE))
+            DesktopTrackLog.log(
+                "DesktopMacFrame: set NSWindowStyleMaskResizable for Space fullscreen " +
+                    "(was 0x${current.toString(16)})",
+            )
+        }.onFailure {
+            DesktopTrackLog.log("DesktopMacFrame: ensureResizableStyleMask failed: ${it.message}")
+        }
+    }
+
+    private fun restoreStyleMaskAfterFullscreen(nsWindow: Pointer) {
+        if (styleMaskBeforeFullscreen == null) return
+        if (isMainThread()) {
+            restoreStyleMaskAfterFullscreenOnMainThread(nsWindow)
+            return
+        }
+        val tu = threadUtilities ?: return
+        val helper = helperInstance ?: return
+        val selPerform = selPerformOnMain ?: return
+        val selAction = selRestoreStyleMaskAction ?: return
+        val send = msgSend ?: return
+        runCatching {
+            send.invoke(arrayOf(tu, selPerform, selAction, helper, helper, false))
+        }.onFailure {
+            DesktopTrackLog.log("DesktopMacFrame: dispatch restoreStyleMask failed: ${it.message}")
+        }
+    }
+
+    private fun restoreStyleMaskAfterFullscreenOnMainThread(nsWindow: Pointer) {
+        val saved = styleMaskBeforeFullscreen ?: return
+        styleMaskBeforeFullscreen = null
+        val o = objc ?: return
+        val send = msgSend ?: return
+        runCatching {
+            val selSetStyleMask = o.sel_registerName("setStyleMask:")
+            send.invoke(arrayOf(nsWindow, selSetStyleMask, saved and NS_WINDOW_STYLE_MASK_FULL_SCREEN.inv()))
+        }.onFailure {
+            DesktopTrackLog.log("DesktopMacFrame: restoreStyleMask failed: ${it.message}")
+        }
+    }
+
+    private fun repairBackdropAfterFullscreen() {
+        val existing = effectViewPtr
+        if (existing != null && isViewAttached(existing)) {
+            // Hierarchy survived — just refresh material/corners, no teardown.
+            updateCornerRadius(DesktopWindowMode.maximized.value)
+            DesktopWindowBackdrop.apply()
+            return
+        }
+        DesktopTrackLog.log("DesktopMacFrame: repairing vibrancy after full-screen exit")
+        invalidateEffectView()
+        windowConfigured = false
+        awtWindow?.let { window ->
+            window.background = Color(0, 0, 0, 0)
+            (window as? RootPaneContainer)?.let { rpc ->
+                rpc.contentPane?.background = Color(0, 0, 0, 0)
+                (rpc.contentPane as? javax.swing.JComponent)?.isOpaque = false
+                rpc.rootPane?.isOpaque = false
+                rpc.rootPane?.background = Color(0, 0, 0, 0)
+            }
+        }
+        DesktopWindowBackdrop.apply()
+    }
+
+    private fun isViewAttached(view: Pointer): Boolean {
+        val o = objc ?: return false
+        val send = msgSend ?: return false
+        return runCatching {
+            val selSuperview = o.sel_registerName("superview")
+            val superview = send.invokePointer(arrayOf(view, selSuperview))
+            superview != null && superview != Pointer.NULL
+        }.getOrDefault(false)
+    }
+
+    private fun invalidateEffectView() {
+        val o = objc
+        val send = msgSend
+        val view = effectViewPtr
+        effectViewPtr = null
+        if (o == null || send == null || view == null) return
+        runCatching {
+            val selRemove = o.sel_registerName("removeFromSuperview")
+            send.invoke(arrayOf(view, selRemove))
+        }
+    }
+
     private fun applyDarkAppearance(nsWindow: Pointer, effectView: Pointer?) {
         val o = objc ?: return
         val send = msgSend ?: return
@@ -399,24 +743,23 @@ internal object DesktopMacFrame {
 
             val selSetAppearance = o.sel_registerName("setAppearance:")
 
-            // 1. Enforce dark mode for the entire application process
-            val nsAppClass = o.objc_getClass("NSApplication")
-            if (nsAppClass != null) {
-                val selSharedApp = o.sel_registerName("sharedApplication")
-                val app = send.invokePointer(arrayOf(nsAppClass, selSharedApp))
-                if (app != null && app != Pointer.NULL) {
-                    send.invoke(arrayOf(app, selSetAppearance, darkAppearance))
+            // App-wide appearance once; repeated setAppearance: during Space transitions stalls UI.
+            if (!darkAppearanceApplied) {
+                val nsAppClass = o.objc_getClass("NSApplication")
+                if (nsAppClass != null) {
+                    val selSharedApp = o.sel_registerName("sharedApplication")
+                    val app = send.invokePointer(arrayOf(nsAppClass, selSharedApp))
+                    if (app != null && app != Pointer.NULL) {
+                        send.invoke(arrayOf(app, selSetAppearance, darkAppearance))
+                    }
                 }
+                darkAppearanceApplied = true
             }
 
-            // 2. Enforce dark mode on the window
             send.invoke(arrayOf(nsWindow, selSetAppearance, darkAppearance))
-
-            // 3. Enforce dark mode on the vibrancy view
             if (effectView != null && effectView != Pointer.NULL) {
                 send.invoke(arrayOf(effectView, selSetAppearance, darkAppearance))
             }
-            DesktopTrackLog.log("DesktopMacFrame: enforced NSAppearanceNameDarkAqua")
         }.onFailure {
             DesktopTrackLog.log("DesktopMacFrame: failed to apply dark appearance: ${it.message}")
         }
@@ -446,7 +789,11 @@ internal object DesktopMacFrame {
             windowConfigured = true
         }
 
-        effectViewPtr?.let { return it }
+        effectViewPtr?.let { existing ->
+            if (isViewAttached(existing)) return existing
+            DesktopTrackLog.log("DesktopMacFrame: effect view detached — recreating")
+            invalidateEffectView()
+        }
 
         val selContentView = o.sel_registerName("contentView")
         val contentView = send.invokePointer(arrayOf(nsWindow, selContentView)) ?: run {
@@ -485,30 +832,195 @@ internal object DesktopMacFrame {
         if (layer != null && layer != Pointer.NULL) {
             val selSetCornerRadius = o.sel_registerName("setCornerRadius:")
             val selSetMasksToBounds = o.sel_registerName("setMasksToBounds:")
-            val radius = if (DesktopWindowMode.maximized.value) 0.0 else 10.0
+            val radius = if (DesktopWindowMode.maximized.value || DesktopWindowMode.fullScreen.value) {
+                0.0
+            } else {
+                10.0
+            }
             send.invoke(arrayOf(layer, selSetCornerRadius, radius))
             send.invoke(arrayOf(layer, selSetMasksToBounds, true))
         }
 
-        // Add behind AWTView (in superview if available, else below contentView)
+        // Always a sibling behind AWT's contentView so the effect view cannot steal mouse events.
         val selAddSubview = o.sel_registerName("addSubview:positioned:relativeTo:")
-        if (superview != contentView) {
-            send.invoke(arrayOf(superview, selAddSubview, view, -1L, contentView))
+        val parent = if (superview != contentView) superview else run {
+            // contentView has no useful superview — still place below it if possible, else at back.
+            superview
+        }
+        if (parent != contentView) {
+            send.invoke(arrayOf(parent, selAddSubview, view, -1L, contentView))
         } else {
             send.invoke(arrayOf(contentView, selAddSubview, view, -1L, null))
+            // Subview of the AWT root can sit above Skia; force it to the back of the stack.
+            val selSendBack = o.sel_registerName("sendSubviewToBack:")
+            runCatching { send.invoke(arrayOf(contentView, selSendBack, view)) }
         }
 
         pinConstraints(view, contentView)
 
         effectViewPtr = view
         applyDarkAppearance(nsWindow, view)
+        DesktopTrackLog.log("DesktopMacFrame: NSVisualEffectView installed behind contentView")
         return view
+    }
+
+    /**
+     * AppKit on recent macOS invokes `windowWillReturnFieldEditor:toObject:` on AWTWindow while
+     * entering a full-screen Space. OpenJDK's AWTWindow never implemented that optional delegate
+     * method, so the unrecognized selector aborts the JVM. Patch it once to return nil.
+     */
+    private fun ensureAwtWindowFieldEditorStub() {
+        if (!fieldEditorStubInstalled.compareAndSet(false, true)) return
+        val o = objc ?: return
+        val awtWindowClass = o.objc_getClass("AWTWindow") ?: run {
+            fieldEditorStubInstalled.set(false)
+            return
+        }
+        val sel = o.sel_registerName("windowWillReturnFieldEditor:toObject:")
+        val added = o.class_addMethod(awtWindowClass, sel, fieldEditorStubRef, "@@:@@")
+        DesktopTrackLog.log(
+            if (added) "DesktopMacFrame: installed AWTWindow field-editor stub"
+            else "DesktopMacFrame: AWTWindow already has windowWillReturnFieldEditor:toObject:",
+        )
+    }
+
+    private fun enableEawtFullScreen(window: Window) {
+        runCatching {
+            (window as? RootPaneContainer)?.rootPane?.putClientProperty("apple.awt.fullscreenable", true)
+            val util = Class.forName("com.apple.eawt.FullScreenUtilities")
+            util.getMethod("setWindowCanFullScreen", Window::class.java, java.lang.Boolean.TYPE)
+                .invoke(null, window, true)
+            if (!eawtListenerRegistered) {
+                val listenerClass = Class.forName("com.apple.eawt.FullScreenListener")
+                val listener = Proxy.newProxyInstance(
+                    listenerClass.classLoader,
+                    arrayOf(listenerClass),
+                ) { _, method, _ ->
+                    when (method.name) {
+                        "windowEnteredFullScreen" -> {
+                            onNativeFullscreenChanged(entered = true)
+                            DesktopTrackLog.log("DesktopMacFrame: eawt entered full-screen")
+                        }
+                        "windowExitedFullScreen" -> {
+                            onNativeFullscreenChanged(entered = false)
+                            DesktopTrackLog.log("DesktopMacFrame: eawt left full-screen")
+                        }
+                    }
+                    null
+                }
+                eawtListenerRef = listener
+                util.getMethod("addFullScreenListenerTo", Window::class.java, listenerClass)
+                    .invoke(null, window, listener)
+                eawtListenerRegistered = true
+            }
+        }.onFailure {
+            DesktopTrackLog.log("DesktopMacFrame: eawt fullscreen setup failed: ${it.message}")
+        }
+    }
+
+    private fun requestToggleFullScreen(window: Window): Boolean {
+        val eawtOk = runCatching {
+            val appClass = Class.forName("com.apple.eawt.Application")
+            val app = appClass.getMethod("getApplication").invoke(null)
+            appClass.getMethod("requestToggleFullScreen", Window::class.java).invoke(app, window)
+            true
+        }.onFailure {
+            DesktopTrackLog.log("DesktopMacFrame: eawt requestToggleFullScreen unavailable: ${it.message}")
+        }.getOrDefault(false)
+        if (eawtOk) return true
+        // Same path CPlatformWindow uses: -[NSWindow toggleFullScreen:]. Safe once the
+        // windowWillReturnFieldEditor:toObject: stub is installed on AWTWindow.
+        return dispatchToggleFullScreenToMainThread()
+    }
+
+    private fun dispatchToggleFullScreenToMainThread(): Boolean {
+        if (windowPtr == null) return false
+        if (isMainThread()) {
+            return runCatching {
+                toggleFullScreenOnMainThread()
+                true
+            }.getOrDefault(false)
+        }
+        val tu = threadUtilities ?: return runCatching {
+            toggleFullScreenOnMainThread()
+            true
+        }.getOrDefault(false)
+        val helper = helperInstance ?: return false
+        val selPerform = selPerformOnMain ?: return false
+        val selAction = selToggleFullScreenAction ?: return false
+        val send = msgSend ?: return false
+        return runCatching {
+            send.invoke(arrayOf(tu, selPerform, selAction, helper, helper, false))
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun toggleFullScreenOnMainThread() {
+        val o = objc ?: return
+        val send = msgSend ?: return
+        val nsWindow = windowPtr ?: return
+        enableFullScreenPrimary(nsWindow)
+        val sel = o.sel_registerName("toggleFullScreen:")
+        send.invoke(arrayOf(nsWindow, sel, null as Pointer?))
+        DesktopTrackLog.log("DesktopMacFrame: invoked NSWindow toggleFullScreen:")
+    }
+
+    private fun enableFullScreenPrimary(nsWindow: Pointer) {
+        val o = objc ?: return
+        val send = msgSend ?: return
+        runCatching {
+            val selCollectionBehavior = o.sel_registerName("collectionBehavior")
+            val current = (send.invoke(Long::class.java, arrayOf(nsWindow, selCollectionBehavior)) as? Number)
+                ?.toLong() ?: 0L
+            val selSetCollectionBehavior = o.sel_registerName("setCollectionBehavior:")
+            send.invoke(
+                arrayOf(
+                    nsWindow,
+                    selSetCollectionBehavior,
+                    current or NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_PRIMARY,
+                ),
+            )
+        }.onFailure {
+            DesktopTrackLog.log("DesktopMacFrame: failed to enable full-screen primary: ${it.message}")
+        }
+    }
+
+    private fun registerFullscreenObservers(nsWindow: Pointer) {
+        if (fullscreenObserversRegistered) return
+        val o = objc ?: return
+        val send = msgSend ?: return
+        val helper = helperInstance ?: return
+        runCatching {
+            val centerClass = o.objc_getClass("NSNotificationCenter") ?: return
+            val selDefaultCenter = o.sel_registerName("defaultCenter")
+            val center = send.invokePointer(arrayOf(centerClass, selDefaultCenter)) ?: return
+            val nsStringClass = o.objc_getClass("NSString") ?: return
+            val selUtf8 = o.sel_registerName("stringWithUTF8String:")
+            val enterName = send.invokePointer(
+                arrayOf(nsStringClass, selUtf8, "NSWindowDidEnterFullScreenNotification"),
+            ) ?: return
+            val exitName = send.invokePointer(
+                arrayOf(nsStringClass, selUtf8, "NSWindowDidExitFullScreenNotification"),
+            ) ?: return
+            val selAdd = o.sel_registerName("addObserver:selector:name:object:")
+            val selEnter = o.sel_registerName("didEnterFullScreen:")
+            val selExit = o.sel_registerName("didExitFullScreen:")
+            send.invoke(arrayOf(center, selAdd, helper, selEnter, enterName, nsWindow))
+            send.invoke(arrayOf(center, selAdd, helper, selExit, exitName, nsWindow))
+            fullscreenObserversRegistered = true
+            DesktopTrackLog.log("DesktopMacFrame: full-screen observers registered")
+        }.onFailure {
+            DesktopTrackLog.log("DesktopMacFrame: failed to register full-screen observers: ${it.message}")
+        }
     }
 
     private fun applyNativeBackdropOnMainThread(nativeKind: Int) {
         val o = objc ?: return
         val send = msgSend ?: return
         val nsWindow = windowPtr ?: return
+        ensureResizableStyleMaskOnMainThread(nsWindow)
+        enableFullScreenPrimary(nsWindow)
+        registerFullscreenObservers(nsWindow)
 
         val effectView = ensureWindowAndEffectView(o, send, nsWindow) ?: return
 

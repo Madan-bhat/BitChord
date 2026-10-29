@@ -87,9 +87,10 @@ private fun desktopMain() = application {
         snapshotFlow { state.placement }.collect(DesktopWindowMode::adopt)
     }
     val maximized by DesktopWindowMode.maximized.collectAsState()
-    LaunchedEffect(maximized) {
+    val fullScreen by DesktopWindowMode.fullScreen.collectAsState()
+    LaunchedEffect(maximized, fullScreen) {
         if (DesktopPlatform.isMac) {
-            DesktopMacFrame.updateCornerRadius(maximized)
+            DesktopMacFrame.updateCornerRadius(maximized || fullScreen)
         }
     }
     Window(
@@ -152,7 +153,10 @@ private fun desktopMain() = application {
                     if (!DesktopWindowsFrame.minimize()) state.isMinimized = true
                 },
                 toggleMaximize = {
-                    if (!DesktopWindowsFrame.toggleMaximize()) {
+                    // macOS green traffic light: enter/leave a full-screen Space, not a zoomed frame.
+                    if (DesktopPlatform.isMac) {
+                        DesktopWindowMode.toggle()
+                    } else if (!DesktopWindowsFrame.toggleMaximize()) {
                         // An undecorated AWT window otherwise maximizes to the monitor bounds on
                         // Windows when the native frame bridge is unavailable. Give AWT the
                         // monitor's usable work area before Compose switches the placement.

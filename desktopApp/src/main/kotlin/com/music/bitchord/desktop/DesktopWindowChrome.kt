@@ -116,6 +116,9 @@ internal fun DesktopWindowButtons(modifier: Modifier = Modifier) {
     if (!DesktopPlatform.drawsOwnWindowFrame) return
     val actions = LocalDesktopWindowActions.current ?: return
     val maximized by DesktopWindowMode.maximized.collectAsState()
+    val fullScreen by DesktopWindowMode.fullScreen.collectAsState()
+    // On macOS the green control owns a full-screen Space; elsewhere it is ordinary maximize.
+    val expanded = if (DesktopPlatform.isMac) fullScreen else maximized
     val windowInfo = androidx.compose.ui.platform.LocalWindowInfo.current
     val isFocused = windowInfo.isWindowFocused
     val inactiveFill = if (!isFocused && DesktopPlatform.isMac) Color.White.copy(alpha = 0.22f) else null
@@ -153,7 +156,12 @@ internal fun DesktopWindowButtons(modifier: Modifier = Modifier) {
             )
         }
         MacCaptionButton(
-            if (maximized) "Restore" else "Maximize",
+            when {
+                DesktopPlatform.isMac && expanded -> "Exit Full Screen"
+                DesktopPlatform.isMac -> "Enter Full Screen"
+                expanded -> "Restore"
+                else -> "Maximize"
+            },
             MAC_MAXIMIZE,
             onClick = actions.toggleMaximize,
             inactiveFill = inactiveFill,

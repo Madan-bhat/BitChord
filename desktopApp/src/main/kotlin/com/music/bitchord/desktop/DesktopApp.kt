@@ -6,6 +6,7 @@ import com.music.bitchord.ui.components.ShelfRowChrome
 import com.music.bitchord.ui.components.ShelfRow
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.ui.input.key.isAltPressed
+import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.isMetaPressed
 import androidx.compose.ui.input.pointer.isBackPressed
 import androidx.compose.ui.input.pointer.isSecondaryPressed
@@ -3182,6 +3183,12 @@ fun BitChordDesktopApp() {
                             DesktopWindowMode.toggle()
                             true
                         }
+                        // System shortcut for entering/leaving macOS fullscreen.
+                        DesktopPlatform.isMac && event.isMetaPressed && event.isCtrlPressed &&
+                            event.key == Key.F -> {
+                            DesktopWindowMode.toggle()
+                            true
+                        }
                         event.key == Key.DirectionLeft && event.isAltPressed && !overlays.nowPlaying -> {
                             goBack()
                             true
@@ -3221,6 +3228,10 @@ fun BitChordDesktopApp() {
                             overlays.settingsPage != null &&
                                 !overlays.lastfmLogin && !overlays.listenBrainzToken && !overlays.discordToken -> {
                                 goBack()
+                                true
+                            }
+                            DesktopWindowMode.fullScreen.value -> {
+                                DesktopWindowMode.exit()
                                 true
                             }
                             else -> false
@@ -5180,7 +5191,8 @@ private fun DesktopFrame(
     val glass = material != DesktopBackdrop.OFF
     val materialBehindApp = glass && appBackground
     val maximized by DesktopWindowMode.maximized.collectAsState()
-    val roundCorners = DesktopPlatform.isMac && !maximized
+    val fullScreen by DesktopWindowMode.fullScreen.collectAsState()
+    val roundCorners = DesktopPlatform.isMac && !maximized && !fullScreen
     CompositionLocalProvider(LocalDesktopHaze provides haze) {
         Box(
             modifier

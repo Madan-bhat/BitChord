@@ -83,6 +83,40 @@ class DesktopMacFrameTest {
     }
 
     @Test
+    fun testNativeFullScreenSelectors() {
+        if (!DesktopPlatform.isMac) return
+        val objc = NativeLibrary.getInstance("objc")
+        val registerName = objc.getFunction("sel_registerName")
+        val selStyleMask = registerName.invokePointer(arrayOf("styleMask"))
+        val selSetStyleMask = registerName.invokePointer(arrayOf("setStyleMask:"))
+        val selCollectionBehavior = registerName.invokePointer(arrayOf("setCollectionBehavior:"))
+        val selFieldEditor = registerName.invokePointer(arrayOf("windowWillReturnFieldEditor:toObject:"))
+        val selPerformOnMain = registerName.invokePointer(
+            arrayOf("performOnMainThread:on:withObject:waitUntilDone:"),
+        )
+        assertTrue(selStyleMask != null && selStyleMask != Pointer.NULL, "styleMask must be a valid selector")
+        assertTrue(selSetStyleMask != null && selSetStyleMask != Pointer.NULL, "setStyleMask: must be a valid selector")
+        assertTrue(
+            selPerformOnMain != null && selPerformOnMain != Pointer.NULL,
+            "ThreadUtilities performOnMainThread must be a valid selector",
+        )
+        assertTrue(
+            selCollectionBehavior != null && selCollectionBehavior != Pointer.NULL,
+            "setCollectionBehavior: must be a valid selector",
+        )
+        assertTrue(
+            selFieldEditor != null && selFieldEditor != Pointer.NULL,
+            "windowWillReturnFieldEditor:toObject: must be a valid selector",
+        )
+        // eAWT is how OpenJDK exposes native Space fullscreen without calling -[NSWindow toggleFullScreen:]
+        // directly (that path still hits the AWTWindow field-editor crash without the stub).
+        runCatching {
+            Class.forName("com.apple.eawt.Application")
+            Class.forName("com.apple.eawt.FullScreenUtilities")
+        }.onFailure { throw AssertionError("eAWT fullscreen classes must be on the macOS classpath", it) }
+    }
+
+    @Test
     fun testSetBackdropMaterials() {
         if (!DesktopPlatform.isMac) return
         assertTrue(DesktopMacFrame.setBackdrop(2), "Setting Mica material must succeed")

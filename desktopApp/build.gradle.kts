@@ -499,6 +499,12 @@ compose.desktop {
         mainClass = composeMainClass
         jvmArgs("-Xmx512m")
         jvmArgs("-XX:+UseG1GC", "-XX:G1PeriodicGCInterval=20000", "-XX:G1PeriodicGCSystemLoadThreshold=0")
+        // Native macOS Space fullscreen via com.apple.eawt (OpenJDK keeps it unexported).
+        jvmArgs(
+            "--add-exports=java.desktop/com.apple.eawt=ALL-UNNAMED",
+            "--add-opens=java.desktop/com.apple.eawt=ALL-UNNAMED",
+            "--add-exports=java.desktop/com.apple.eawt.event=ALL-UNNAMED",
+        )
         jvmArgs("-Dbitchord.version=$appVersion")
         if (desktopModuleIndexUrl.isNotBlank()) {
             jvmArgs("-Dbitchord.module.index=$desktopModuleIndexUrl")

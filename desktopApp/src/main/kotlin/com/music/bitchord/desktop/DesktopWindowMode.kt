@@ -39,6 +39,11 @@ internal object DesktopWindowMode {
         if (DesktopPlatform.isWindows && _fullScreen.value && DesktopWindowsFrame.setFullscreen(false)) {
             DesktopWindowBackdrop.apply()
         }
+        // Leaving a full-screen Space is what the green button means while full screen; do not also zoom.
+        if (DesktopPlatform.isMac && _fullScreen.value) {
+            setFullScreen(false)
+            return
+        }
         _fullScreen.value = false
         set(if (_placement.value == WindowPlacement.Maximized) WindowPlacement.Floating else WindowPlacement.Maximized)
     }
@@ -51,25 +56,58 @@ internal object DesktopWindowMode {
         if (_fullScreen.value) setFullScreen(false)
     }
 
+    /**
+     * Keep the player's full-screen flag in step when AppKit or eAWT reports a Space enter/exit
+     * (system green button, Ctrl+Cmd+F, Mission Control, Esc).
+     */
+    fun adoptNativeFullscreen(on: Boolean) {
+        _fullScreen.value = on
+        // If AppKit left the Space without Compose knowing, drop Fullscreen placement so it
+        // doesn't keep driving Skiko's fullscreen bit.
+        if (!on && _placement.value == WindowPlacement.Fullscreen) {
+            _placement.value = WindowPlacement.Floating
+            _maximized.value = false
+        }
+    }
+
     /** Takes the window's word for how it is sitting, rather than this object's. */
     fun adopt(placement: WindowPlacement) {
         if (placement == _placement.value) return
-        if (placement == WindowPlacement.Floating) _fullScreen.value = false
+        // Compose / traffic lights / Ctrl+Cmd+F can change placement underneath us.
+        when (placement) {
+            WindowPlacement.Fullscreen -> _fullScreen.value = true
+            WindowPlacement.Floating, WindowPlacement.Maximized -> {
+                if (_fullScreen.value) _fullScreen.value = false
+            }
+        }
         set(placement)
     }
 
     private fun setFullScreen(on: Boolean) {
-        _fullScreen.value = on
         // On Windows the only thing that covers a taskbar told to stay on top is a native borderless
         // window raised above it; no Compose placement does, and true Fullscreen paints the screen
         // white. With that in place the window's placement is left as it was — it is the Win32 style
         // that changes, not the placement.
         if (DesktopPlatform.isWindows && DesktopWindowsFrame.setFullscreen(on)) {
+            _fullScreen.value = on
             // The native window resets DWM's frame margin on the way out; the chosen material goes
             // back over it so the window is exactly as it was before fullscreen.
             if (!on) DesktopWindowBackdrop.apply()
             return
         }
+        // On macOS, Compose WindowPlacement.Fullscreen → Skiko's osxSetFullscreenNative →
+        // AppKit toggleFullScreen: (same Space model Electron uses). Placement must be
+        // Fullscreen — not Floating — or Compose keeps re-applying the old window size and the
+        // UI stays letterboxed inside the Space (Compose #4573 / OpenJFX JDK-8353314).
+        // prepareNativeFullscreen adds NSWindowStyleMaskResizable + the AWTWindow field-editor
+        // stub that otherwise aborts the JVM on recent macOS.
+        if (DesktopPlatform.isMac) {
+            DesktopMacFrame.prepareNativeFullscreen()
+            _fullScreen.value = on
+            set(if (on) WindowPlacement.Fullscreen else WindowPlacement.Floating)
+            return
+        }
+        _fullScreen.value = on
         set(if (on) fillsScreen else WindowPlacement.Floating)
     }
 
